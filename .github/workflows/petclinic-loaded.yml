@@ -1,0 +1,140 @@
+# P1 — does the application-context suite decide the never-loaded number?
+#
+# Commit this into the petclinic FORK as .github/workflows/petclinic-loaded.yml, then dispatch.
+#
+# WHAT IT IS FOR. CS-7 recorded petclinic at 12.3% never-loaded with two errors, and the record
+# reasoned that broken tests inflate the figure. Recomputing the denominator from the run's own
+# surefire XML showed the suite was 97.3% complete -- so brokenness by test COUNT cannot explain
+# it. But the two broken tests are PostgresIntegrationTests, the only tests in the repository
+# that boot a full Spring context against a real datasource. 2.7% of the suite by count; 100% of
+# its application-context coverage.
+#
+# So this runs the SAME suite TWICE ON THE SAME RUNNER, differing in exactly one thing: whether
+# the application-context tests execute. Same hardware, same JDK, same resolved set, same cache.
+# The delta between the two arms is the answer, with no environment confound -- which is why
+# this is not "re-run it on Linux and compare to the macOS number", a comparison that would vary
+# two things at once.
+#
+# If the delta is large, the coverage denominator must be KIND OF SUITE, not count of tests, and
+# every cell whose integration suite did not run is unpublishable. That is a CS-8 finding in its
+# own right and it changes the harness before the other five cells are worth attempting.
+#
+# WHY ubuntu-latest AND NOT A BOX WE OWN: the repository declares runs-on: ubuntu-latest with
+# JDK 17 / adopt in .github/workflows/maven-build.yml. CS-8 #7 -- running outside the declared
+# environment manufactures blockers and then reports them as properties of the corpus. It also
+# rules out the hub's EC2 instance, which is t4g/aarch64: on ARM, jars that select a native
+# artifact by classifier resolve but never load, which lands in the never-loaded column as a
+# false positive, biased toward "unused".
+
+name: LOADED capture — petclinic
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: >-
+          Commit or branch to measure. Defaults to the corpus pin. A fork's DEFAULT branch tracks
+          upstream's head, not our SHA, so measuring the default branch measures different code
+          than corpus.yaml claims — and the number would silently not be comparable to CS-7.
+        required: false
+        default: 'depproof-pinned'
+
+permissions:
+  contents: read
+
+jobs:
+  capture:
+    runs-on: ubuntu-latest          # declared by the repo. Do not "improve" this.
+    steps:
+      # The workflow lives on the DEFAULT branch (GitHub only offers Run workflow there) but
+      # measures the PIN. Same split as templates/depproof-fork.yml.
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
+
+      - name: Set up JDK 17 (adopt, as the repo declares)
+        uses: actions/setup-java@v4
+        with:
+          java-version: '17'
+          distribution: 'temurin'   # 'adopt' is the retired name for the same builds
+          cache: maven
+
+      # Build once, untraced. Compilation loads the compiler's own dependencies and none of the
+      # application's, so tracing it would add noise with no signal.
+      - name: Build (untraced)
+        run: ./mvnw -B -DskipTests package
+
+      # ---------------------------------------------------------------- arm A: the full suite
+      # Docker is preinstalled on ubuntu-latest, so spring.docker.compose starts the postgres
+      # service from the repo's own compose file and PostgresIntegrationTests boots for real.
+      - name: Arm A — full suite, application context boots
+        env:
+          JAVA_TOOL_OPTIONS: -Xlog:class+load=info:file=${{ github.workspace }}/traces/full/trace-%p.log
+        run: |
+          mkdir -p traces/full
+          ./mvnw -B verify || echo "suite exited $? — a partial suite still yields a valid trace"
+
+      - name: Preserve arm A results before the rebuild clobbers them
+        run: |
+          mkdir -p results/full
+          find . -path '*/surefire-reports/TEST-*.xml' -exec cp {} results/full/ \; 2>/dev/null || true
+
+      # ---------------------------------------------------------- arm B: no application context
+      # The ONLY difference from arm A. Every excluded class boots a Spring context; the rest are
+      # plain unit tests. If the never-loaded share barely moves, the app-context hypothesis is
+      # dead and test count is an adequate denominator after all.
+      - name: Arm B — unit tests only, no application context
+        env:
+          JAVA_TOOL_OPTIONS: -Xlog:class+load=info:file=${{ github.workspace }}/traces/unit/trace-%p.log
+        run: |
+          mkdir -p traces/unit
+          ./mvnw -B test \
+            -Dtest='!PostgresIntegrationTests,!MySqlIntegrationTests,!PetClinicIntegrationTests,!CrashControllerIntegrationTests,!PetClinicConcurrencyTests' \
+            -DfailIfNoSpecifiedTests=false \
+            || echo "suite exited $? — expected; recorded as incomplete by the analyser"
+
+      - name: Preserve arm B results
+        run: |
+          mkdir -p results/unit
+          find . -path '*/surefire-reports/TEST-*.xml' -exec cp {} results/unit/ \; 2>/dev/null || true
+
+      # ------------------------------------------------------------------------------- canary
+      # CS-8 #1, and the reason this step exists at all: gson ran 118 test classes green with
+      # exit 0 and produced ZERO trace lines, because its pom overrides <argLine>. A harness that
+      # trusted the exit code would have reported "nothing loaded" -- 100% never-loaded. Fail the
+      # job here rather than let an empty trace become a percentage in a table.
+      - name: Canary — the tracer actually attached
+        run: |
+          for arm in full unit; do
+            n=$(cat traces/$arm/*.log 2>/dev/null | grep -c 'class,load' || true)
+            echo "$arm: $n class-load lines across $(ls traces/$arm 2>/dev/null | wc -l) process traces"
+            if [ "${n:-0}" -lt 1000 ]; then
+              echo "::error::arm $arm produced $n class-load lines. The tracer did not attach."
+              exit 1
+            fi
+          done
+
+      # The PRIMARY denominator (decided 2026-08-31): depproof's own resolved set, because that
+      # is what the shipped LOADED axis would annotate.
+      - name: Resolved set — depproof SBOM
+        run: |
+          mkdir -p sbom
+          docker run --rm -v "$PWD:/w" -w /w ghcr.io/depproof/depproof:v0 \
+            scan --discover --output-dir sbom || true
+          ls -la sbom/
+
+      # The CROSS-CHECK denominator: Maven's own view. A divergence is a fidelity measurement,
+      # not a nuisance, so it is captured rather than reconciled away.
+      - name: Cross-check — Maven's resolved list
+        run: |
+          ./mvnw -B dependency:list -DoutputFile=$PWD/maven-resolved.txt -DappendOutput=true || true
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: loaded-petclinic
+          path: |
+            traces/
+            results/
+            sbom/
+            maven-resolved.txt
+          retention-days: 14
