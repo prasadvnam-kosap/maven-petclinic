@@ -122,7 +122,11 @@ jobs:
 
       # The PRIMARY denominator (decided 2026-08-31): depproof's own resolved set, because that
       # is what the shipped LOADED axis would annotate.
+      # if: always() -- the canary above fails the job when the measurement cannot be
+      # trusted. Without this the artifact is never uploaded, so the one run that most
+      # needs diagnosing is the one that returns no data. The job still goes red.
       - name: Resolved set — depproof SBOM
+        if: always()
         run: |
           mkdir -p sbom
           docker run --rm -v "$PWD:/w" -w /w ghcr.io/depproof/depproof:v0 \
@@ -131,11 +135,19 @@ jobs:
 
       # The CROSS-CHECK denominator: Maven's own view. A divergence is a fidelity measurement,
       # not a nuisance, so it is captured rather than reconciled away.
+      # if: always() -- the canary above fails the job when the measurement cannot be
+      # trusted. Without this the artifact is never uploaded, so the one run that most
+      # needs diagnosing is the one that returns no data. The job still goes red.
       - name: Cross-check — Maven's resolved list
+        if: always()
         run: |
           ./mvnw -B dependency:list -DoutputFile=$PWD/maven-resolved.txt -DappendOutput=true || true
 
+      # if: always() -- the canary above fails the job when the measurement cannot be
+      # trusted. Without this the artifact is never uploaded, so the one run that most
+      # needs diagnosing is the one that returns no data. The job still goes red.
       - uses: actions/upload-artifact@v4
+        if: always()
         with:
           name: loaded-petclinic
           path: |
