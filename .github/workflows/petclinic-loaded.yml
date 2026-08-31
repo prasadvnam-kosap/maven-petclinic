@@ -74,10 +74,16 @@ jobs:
           mkdir -p traces/full
           ./mvnw -B verify || echo "suite exited $? — a partial suite still yields a valid trace"
 
-      - name: Preserve arm A results before the rebuild clobbers them
+      # Copy arm A's reports out, THEN delete them. Surefire does not clean the report
+      # directory, and `mvn test` only rewrites the classes it actually runs -- so without this
+      # delete, arm B's results directory keeps arm A's XML for every class arm B excluded and
+      # the arm B denominator silently claims those suites ran. Found on the first real run:
+      # both arms reported "73 tests, 0 failures" when arm B had run 63.
+      - name: Preserve arm A results, then clear them for arm B
         run: |
           mkdir -p results/full
           find . -path '*/surefire-reports/TEST-*.xml' -exec cp {} results/full/ \; 2>/dev/null || true
+          find . -type d -name surefire-reports -exec rm -rf {} + 2>/dev/null || true
 
       # ---------------------------------------------------------- arm B: no application context
       # The ONLY difference from arm A. Every excluded class boots a Spring context; the rest are
